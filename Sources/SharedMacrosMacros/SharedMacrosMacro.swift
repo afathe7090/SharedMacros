@@ -1033,7 +1033,10 @@ public struct SpyMacro: PeerMacro {
       }
     }
     
-    equalityCases.append("      default: return false")
+    // Only add default case when there are 2+ cases (avoids "default will never be executed" warning)
+    if methods.count > 1 {
+      equalityCases.append("      default: return false")
+    }
     
     return """
       enum State: Equatable {
@@ -1048,7 +1051,7 @@ public struct SpyMacro: PeerMacro {
     """
   }
   
-  // Generate method storage (completions, continuations, subjects)
+  // Generate method storage (completions, continuations, subjects, stubs, received args)
   private static func generateMethodStorageStrings(method: MethodInfo) -> [String] {
     var storage: [String] = []
     
@@ -1064,10 +1067,22 @@ public struct SpyMacro: PeerMacro {
         storage.append("  private(set) var \(method.name)ReceivedResults: [Result<\(successType), \(errorType)>] = []")
       }
     } else if method.isAsync {
+      // Continuation storage (for resume-after-suspension pattern)
       if method.isThrowing {
         storage.append("  private var \(method.name)Continuations: [CheckedContinuation<\(method.returnType), Error>] = []")
-      } else {
+      } else if method.returnType != "Void" {
         storage.append("  private var \(method.name)Continuations: [UnsafeContinuation<\(method.returnType), Never>] = []")
+      }
+      // async -> Void: no continuation needed, completes immediately
+      
+      // Private result storage for pre-configured returns.
+      // Set via complete* methods — the async method returns this immediately.
+      if method.isThrowing && method.returnType == "Void" {
+        storage.append("  private var \(method.name)Result: Result<Void, Error>?")
+      } else if method.isThrowing {
+        storage.append("  private var \(method.name)Result: Result<\(method.returnType), Error>?")
+      } else if method.returnType != "Void" {
+        storage.append("  private var \(method.name)ReturnValue: \(method.returnType)?")
       }
     } else if method.returnType.contains("AnyPublisher") {
       let (outputType, failureType) = extractPublisherTypes(from: method.returnType)
@@ -1082,6 +1097,17 @@ public struct SpyMacro: PeerMacro {
       }
     }
     
+    // Received arguments tracking for all methods with parameters
+    if !method.parameters.isEmpty {
+      if method.parameters.count == 1 {
+        let param = method.parameters[0]
+        storage.append("  private(set) var \(method.name)Received\(param.name.prefix(1).uppercased() + param.name.dropFirst())s: [\(param.type)] = []")
+      } else {
+        let tupleType = method.parameters.map { "\($0.name): \($0.type)" }.joined(separator: ", ")
+        storage.append("  private(set) var \(method.name)ReceivedArguments: [(\(tupleType))] = []")
+      }
+    }
+    
     if !storage.isEmpty {
       storage.append("")
     }
@@ -1091,8 +1117,6 @@ public struct SpyMacro: PeerMacro {
   
   // Generate protocol method implementation
   private static func generateMethodImplementationString(method: MethodInfo, isOverride: Bool) -> String {
-    let capitalizedName = method.name.prefix(1).uppercased() + method.name.dropFirst()
-    
     // Build state case
     let stateCase: String
     if method.parameters.isEmpty {
@@ -1149,14 +1173,46 @@ public struct SpyMacro: PeerMacro {
     var body: [String] = []
     body.append("    states.append(\(stateCase))")
     
+    // Record received arguments
+    if !method.parameters.isEmpty {
+      if method.parameters.count == 1 {
+        let param = method.parameters[0]
+        body.append("    \(method.name)Received\(param.name.prefix(1).uppercased() + param.name.dropFirst())s.append(\(param.name))")
+      } else {
+        let tupleArgs = method.parameters.map { "\($0.name): \($0.name)" }.joined(separator: ", ")
+        body.append("    \(method.name)ReceivedArguments.append((\(tupleArgs)))")
+      }
+    }
+    
     if method.completionParam != nil {
       body.append("    \(method.name)Completions.append(\(method.completionParam!.name))")
     } else if method.isAsync {
-      if method.isThrowing {
+      // Modern concurrency: check pre-configured result first for immediate return,
+      // fallback to continuation for manual resume-after-suspension pattern.
+      if method.isThrowing && method.returnType == "Void" {
+        // async throws -> Void
+        body.append("    if let result = \(method.name)Result {")
+        body.append("      try result.get()")
+        body.append("      return")
+        body.append("    }")
         body.append("    return try await withCheckedThrowingContinuation { continuation in")
         body.append("      \(method.name)Continuations.append(continuation)")
         body.append("    }")
+      } else if method.isThrowing {
+        // async throws -> T
+        body.append("    if let result = \(method.name)Result {")
+        body.append("      return try result.get()")
+        body.append("    }")
+        body.append("    return try await withCheckedThrowingContinuation { continuation in")
+        body.append("      \(method.name)Continuations.append(continuation)")
+        body.append("    }")
+      } else if method.returnType == "Void" {
+        // async -> Void: completes immediately, no suspension needed
       } else {
+        // async -> T (non-throwing)
+        body.append("    if let value = \(method.name)ReturnValue {")
+        body.append("      return value")
+        body.append("    }")
         body.append("    return await withUnsafeContinuation { continuation in")
         body.append("      \(method.name)Continuations.append(continuation)")
         body.append("    }")
@@ -1261,33 +1317,72 @@ public struct SpyMacro: PeerMacro {
         helpers.append("  }")
       }
     } else if method.isAsync {
-      // Async helpers
-      if method.isThrowing {
+      // Async helpers — unified: pre-configure (before call) or resume (after suspension).
+      // If a continuation is pending → resume it. Otherwise → store for next call.
+      if method.isThrowing && method.returnType == "Void" {
+        // async throws -> Void
         helpers.append("")
-        helpers.append("  func complete\(capitalizedName)(with result: Result<\(method.returnType), Error>, at index: Int = 0) {")
-        helpers.append("    switch result {")
-        helpers.append("    case .success(let value):")
-        helpers.append("      \(method.name)Continuations[index].resume(returning: value)")
-        helpers.append("    case .failure(let error):")
-        helpers.append("      \(method.name)Continuations[index].resume(throwing: error)")
+        helpers.append("  func complete\(capitalizedName)(with result: Result<Void, Error>) {")
+        helpers.append("    if !self.\(method.name)Continuations.isEmpty {")
+        helpers.append("      let continuation = self.\(method.name)Continuations.removeFirst()")
+        helpers.append("      switch result {")
+        helpers.append("      case .success:")
+        helpers.append("        continuation.resume(returning: ())")
+        helpers.append("      case .failure(let error):")
+        helpers.append("        continuation.resume(throwing: error)")
+        helpers.append("      }")
+        helpers.append("    } else {")
+        helpers.append("      self.\(method.name)Result = result")
         helpers.append("    }")
         helpers.append("  }")
         
         helpers.append("")
-        helpers.append("  func complete\(capitalizedName)WithSuccess(_ value: \(method.returnType), at index: Int = 0) {")
-        helpers.append("    \(method.name)Continuations[index].resume(returning: value)")
+        helpers.append("  func complete\(capitalizedName)WithSuccess() {")
+        helpers.append("    complete\(capitalizedName)(with: .success(()))")
         helpers.append("  }")
         
         helpers.append("")
-        helpers.append("  func complete\(capitalizedName)WithError(_ error: Error, at index: Int = 0) {")
-        helpers.append("    \(method.name)Continuations[index].resume(throwing: error)")
+        helpers.append("  func complete\(capitalizedName)WithError(_ error: Error) {")
+        helpers.append("    complete\(capitalizedName)(with: .failure(error))")
         helpers.append("  }")
-      } else {
+      } else if method.isThrowing {
+        // async throws -> T
         helpers.append("")
-        helpers.append("  func complete\(capitalizedName)(with value: \(method.returnType), at index: Int = 0) {")
-        helpers.append("    \(method.name)Continuations[index].resume(returning: value)")
+        helpers.append("  func complete\(capitalizedName)(with result: Result<\(method.returnType), Error>) {")
+        helpers.append("    if !self.\(method.name)Continuations.isEmpty {")
+        helpers.append("      let continuation = self.\(method.name)Continuations.removeFirst()")
+        helpers.append("      switch result {")
+        helpers.append("      case .success(let value):")
+        helpers.append("        continuation.resume(returning: value)")
+        helpers.append("      case .failure(let error):")
+        helpers.append("        continuation.resume(throwing: error)")
+        helpers.append("      }")
+        helpers.append("    } else {")
+        helpers.append("      self.\(method.name)Result = result")
+        helpers.append("    }")
+        helpers.append("  }")
+        
+        helpers.append("")
+        helpers.append("  func complete\(capitalizedName)WithSuccess(_ value: \(method.returnType)) {")
+        helpers.append("    complete\(capitalizedName)(with: .success(value))")
+        helpers.append("  }")
+        
+        helpers.append("")
+        helpers.append("  func complete\(capitalizedName)WithError(_ error: Error) {")
+        helpers.append("    complete\(capitalizedName)(with: .failure(error))")
+        helpers.append("  }")
+      } else if method.returnType != "Void" {
+        // async -> T (non-throwing)
+        helpers.append("")
+        helpers.append("  func complete\(capitalizedName)(with value: \(method.returnType)) {")
+        helpers.append("    if !self.\(method.name)Continuations.isEmpty {")
+        helpers.append("      self.\(method.name)Continuations.removeFirst().resume(returning: value)")
+        helpers.append("    } else {")
+        helpers.append("      self.\(method.name)ReturnValue = value")
+        helpers.append("    }")
         helpers.append("  }")
       }
+      // async -> Void (non-throwing): no helpers needed, completes immediately
     } else if method.returnType.contains("AnyPublisher") {
       // Publisher helpers
       let (outputType, failureType) = extractPublisherTypes(from: method.returnType)
@@ -1318,8 +1413,6 @@ public struct SpyMacro: PeerMacro {
     var enumCases: [String] = []
     
     for method in methods {
-      let capitalizedName = method.name.prefix(1).uppercased() + method.name.dropFirst()
-      
       if method.parameters.isEmpty {
         enumCases.append("case \(method.name)")
       } else {

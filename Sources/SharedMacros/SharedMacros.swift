@@ -64,6 +64,9 @@ public macro MockData() = #externalMacro(module: "SharedMacrosMacros", type: "Mo
 /// Works on protocols, classes, and structs. Tracks method calls, captures arguments,
 /// and provides simulation helpers. Supports completion handlers, async/await, and Combine.
 ///
+/// Place `@Spy` directly on the protocol/class/struct — the macro reads its content
+/// and generates a full spy automatically. No manual method listing required.
+///
 /// Usage on Protocols - Just add @Spy:
 ///
 ///     @Spy
@@ -89,13 +92,13 @@ public macro MockData() = #externalMacro(module: "SharedMacrosMacros", type: "Mo
 ///     }
 ///
 /// This automatically generates a `TypeNameSpy` class with:
-/// - ✅ Complete implementation of all methods
-/// - ✅ Same initializer signature (for classes/structs)
-/// - ✅ State enum tracking all method calls with arguments
-/// - ✅ Completion handlers storage and simulation methods
-/// - ✅ Async continuations and resume methods
-/// - ✅ Combine publisher subjects and simulation helpers
-/// - ✅ Call count and verification helpers
+/// - Complete implementation of all methods from the protocol/class/struct content
+/// - Same initializer signature (for classes/structs)
+/// - State enum tracking all method calls with arguments
+/// - Completion handlers storage and simulation methods
+/// - Async continuations and resume methods
+/// - Combine publisher subjects and simulation helpers
+/// - Call count and verification helpers
 ///
 /// Then use it in tests:
 ///
